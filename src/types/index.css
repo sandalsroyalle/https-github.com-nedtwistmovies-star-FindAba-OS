@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --aba-dark: #011A13;
+    --aba-gold: #E5B25D;
+    --aba-green: #00FF94;
+  }
+
+  body {
+    @apply bg-[#011A13] text-white antialiased selection:bg-[#E5B25D] selection:text-black;
+    font-family: 'Outfit', sans-serif;
+  }
+}
+
+@layer utilities {
+  .animate-spin-slow {
+    animation: spin-slow 12s linear infinite;
+  }
+  
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+@keyframes spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "FindAba | City OS",
+  "description": "The Industrial Heart of West Africa. A commerce and services platform by SANDALSroyalle, integrating the soul of findaba.com.ng.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

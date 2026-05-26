@@ -1,0 +1,1973 @@
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import bcrypt from 'bcryptjs';
+import { 
+  Business, Hotel, Room, Booking, LedgerEntry, 
+  LogisticsOrder, ChatMessage, Advertorial, AdPlan, 
+  PaymentLog, ThriftAccount, ThriftContribution, ThriftGroup, ThriftGroupMember, ThriftGroupContribution, ThriftPayout, Order, OrderStatus, Dispute, PlatformConfig,
+  QualityAudit, SubscriptionTier, RoomType, BuyerSignal, SignalInterest, AdCampaign, HospitalityConfig,
+  AppNotification, HubTier, Task, SupportMessage
+} from '../types/index';
+import { triggerWebhook, WebhookEvent } from './webhookService';
+import { 
+  sendEmail,
+  sendWelcomeEmail, 
+  sendOrderReceivedEmail, 
+  sendMerchantNewOrderEmail,
+  sendAppointmentEmail,
+  sendOrderStatusUpdateEmail
+} from './emailService';
+
+let _supabaseInstance: SupabaseClient | null = null;
+let _currentUrl: string | null = null;
+let _currentKey: string | null = null;
+
+export const resetSupabaseInstance = (force = false) => {
+  if (force) {
+    _supabaseInstance = null;
+    _currentUrl = null;
+    _currentKey = null;
+  }
+};
+
+export const getSupabase = (): SupabaseClient | null => {
+  const manualUrl = localStorage.getItem('findaba_supabase_url');
+  const manualKey = localStorage.getItem('findaba_supabase_key');
+  
+  const env: any = (typeof process !== 'undefined' && process.env) ? process.env : {};
+  const meta: any = (typeof import.meta !== 'undefined' && import.meta.env) ? import.meta.env : {};
+
+  const hardcodedUrl = 'https://pqzjkvqmherngispxlzy.supabase.co';
+  const hardcodedKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBxemprdnFtaGVybmdpc3B4bHp5Iiwicm9sZSI6InFub24iLCJpYXQiOjE3Njc0MjA3MjMsImV4cCI6MjA4Mjk5NjcyM30.Oa6ZXYw5-f3BOHHafFsLPtuBgmV4yOu5BMpulyDC-oc';
+
+  const url = manualUrl || meta.VITE_SUPABASE_URL || env.SUPABASE_URL || hardcodedUrl;
+  const key = manualKey || meta.VITE_SUPABASE_ANON_KEY || env.SUPABASE_ANON_KEY || hardcodedKey;
+
+  if (!url || !key || url === 'undefined' || key === 'undefined') {
+    console.warn("[Registry] Signal missing. URL:", !!url, "Key:", !!key);
+    return null;
+  }
+
+  // If we already have an instance and the config hasn't changed, return it
+  if (_supabaseInstance && _currentUrl === url && _currentKey === key) {
+    return _supabaseInstance;
+  }
+
+  // Prevent using the app's own URL as Supabase URL (common misconfiguration)
+  // Only check in browser context
+  if (typeof window !== 'undefined' && url.includes(window.location.hostname) && !url.includes('supabase.co')) {
+    console.error("[Registry] Loopback detected: Supabase URL points to the application itself. This will cause SYNC ERROR (HTML response). URL:", url);
+    return null;
+  }
+
+  try {
+    console.log(`[Registry] Initializing client with URL: ${url.substring(0, 20)}...`);
+    _supabaseInstance = createClient(url, key, { 
+      auth: { 
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true,
+        // Use a custom storage key to avoid conflicts with other apps on the same domain
+        storageKey: `findaba-auth-token-${url.substring(0, 10)}`,
+        // Disable Web Locks API usage which causes "Lock broken" errors in iframes
+        lock: async (_name: string, _acquireTimeout: number, callback: () => Promise<any>) => {
+          return await callback();
+        }
+      } 
+    });
+    _currentUrl = url;
+    _currentKey = key;
+    return _supabaseInstance;
+  } catch (e) { 
+    console.error("[Registry] Client initialization fault:", e);
+    return null; 
+  }
+};
+
+export const isRegistryConfigured = () => {
+  return !!getSupabase();
+};
+
+const normalizeEmail = (email: string) => email.toLowerCase().trim();
+
+export const authSignUp = async (email: string, pass: string, name: string, referralCodeInput?: string) => {
+  const sb = getSupabase();
+  if (!sb) throw new Error("Registry Offline: Supabase URL or Anon Key is missing in environment/admin.");
+  
+  const normalizedEmail = normalizeEmail(email);
+  // Generate a unique referral code for the new user
+  const myReferralCode = generateReferralCode(name);
+  
+  const { data, error } = await sb.auth.signUp({
+    email: normalizedEmail,
+    password: pass,
+    options: { 
+      data: { 
+        full_name: name,
+        referral_code: myReferralCode,
+        referred_by_code: referralCodeInput || null
+      } 
+    }
+  });
+  if (error) throw error;
+
+  // If signup was successful and there's a referral code, we'll handle the link in a trigger or post-signup
+  // But for robustness, we can try to find the referrer now if the user is immediately logged in
+  if (data.user && referralCodeInput) {
+    try {
+      await processReferral(data.user.id, referralCodeInput);
+    } catch (e) {
+      console.warn("Referral processing deferred:", e);
+    }
+  }
+
+  // 🔹 Send Welcome Email
+  if (data.user) {
+    const referralLink = `https://findaba.com.ng/signup?ref=${myReferralCode}`;
+    sendWelcomeEmail(normalizedEmail, name, referralLink).catch(err => 
+      console.warn("[Email] Welcome email failed (likely due to missing API key):", err)
+    );
+  }
+
+  return data;
+};
+
+export const generateReferralCode = (name: string): string => {
+  const cleanName = name.replace(/[^a-zA-Z]/g, '').toUpperCase();
+  const prefix = cleanName.substring(0, 3) || 'ABA';
+  const random = Math.random().toString(36).substring(2, 7).toUpperCase();
+  return `${prefix}${random}`.substring(0, 10);
+};
+
+export const processReferral = async (newUserId: string, referralCode: string) => {
+  const sb = getSupabase();
+  if (!sb) return;
+
+  // 1. Find the referrer
+  const { data: referrer, error: findError } = await sb
+    .from('profiles')
+    .select('id, referral_count, referral_earnings')
+    .eq('referral_code', referralCode.toUpperCase())
+    .single();
+
+  if (findError || !referrer) {
+    console.warn("Invalid referral code used:", referralCode);
+    return;
+  }
+
+  // 2. Prevent self-referral (though unlikely with codes)
+  if (referrer.id === newUserId) return;
+
+  // 3. Update the new user's profile with the referrer's ID
+  await sb.from('profiles').update({ referred_by: referrer.id }).eq('id', newUserId);
+
+  // 4. Record the referral
+  await sb.from('referrals').insert({
+    referrer_id: referrer.id,
+    referred_user_id: newUserId,
+    reward_granted: true,
+    reward_amount: 500 // Example reward: 500 units
+  });
+
+  // 5. Update referrer's stats
+  await sb.from('profiles').update({
+    referral_count: (referrer.referral_count || 0) + 1,
+    referral_earnings: (referrer.referral_earnings || 0) + 500
+  }).eq('id', referrer.id);
+
+  // 6. Trigger notification for referrer
+  await triggerWebhook(WebhookEvent.REFERRAL_SUCCESS, {
+    referrer_id: referrer.id,
+    new_user_id: newUserId,
+    reward: 500
+  });
+};
+
+export const authSignIn = async (email: string, pass: string) => {
+  const sb = getSupabase();
+  if (!sb) throw new Error("Registry Offline: Industrial signal not detected.");
+  const normalizedEmail = normalizeEmail(email);
+  const { data, error } = await sb.auth.signInWithPassword({
+    email: normalizedEmail,
+    password: pass
+  });
+  if (error) {
+    if (error.message.includes('Invalid login credentials')) throw new Error("Handshake Denied: Key or Email incorrect.");
+    throw error;
+  }
+  
+  // Fetch profile to get role
+  const { data: profile } = await sb.from('profiles').select('role, full_name').eq('id', data.user.id).single();
+  if (profile) {
+    localStorage.setItem('findaba_user_role', profile.role);
+    localStorage.setItem('findaba_user_name', profile.full_name || '');
+  }
+  
+  return data;
+};
+
+export const authSignInWithGoogle = async () => {
+  const sb = getSupabase();
+  if (!sb) throw new Error("Registry Offline: Industrial signal not detected.");
+  const { data, error } = await sb.auth.signInWithOAuth({
+    provider: 'google',
+    options: {
+      redirectTo: window.location.origin
+    }
+  });
+  if (error) throw error;
+  return data;
+};
+
+export const fetchUserProfile = async (userId: string) => {
+  const sb = getSupabase();
+  if (!sb) return null;
+  const { data } = await sb.from('profiles').select('*').eq('id', userId).maybeSingle();
+  return data;
+};
+
+export const updateUserProfile = async (userId: string, updates: any) => {
+  const sb = getSupabase();
+  if (!sb) return;
+  await sb.from('profiles').update(updates).eq('id', userId);
+};
+
+export const fetchReferrals = async (userId: string) => {
+  const sb = getSupabase();
+  if (!sb) return [];
+  try {
+    const { data, error } = await sb
+      .from('referrals')
+      .select('*, referred_user:profiles!referred_user_id(full_name, email)')
+      .eq('referrer_id', userId)
+      .order('created_at', { ascending: false });
+    if (error && error.code === '42P01') return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const fetchAutomationLogs = async () => {
+  const sb = getSupabase();
+  if (!sb) return [];
+  try {
+    const { data, error } = await sb
+      .from('automation_logs')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error && error.code === '42P01') return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const fetchTasks = async () => {
+  const sb = getSupabase();
+  if (!sb) return [];
+  try {
+    const { data, error } = await sb.from('tasks').select('*').order('priority', { ascending: true });
+    if (error && error.code === '42P01') return [];
+    if (error) throw error;
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const createTaskLog = async (task: Partial<Task>) => {
+  const sb = getSupabase();
+  if (!sb) throw new Error("Registry Offline");
+  const { data, error } = await sb.from('tasks').insert([task]).select().single();
+  if (error) throw error;
+  return data;
+};
+
+export const updateTaskItem = async (id: string, updates: Partial<Task>) => {
+  const sb = getSupabase();
+  if (!sb) throw new Error("Registry Offline");
+  const { data, error } = await sb.from('tasks').update(updates).eq('id', id).select().single();
+  if (error) throw error;
+  return data;
+};
+
+export const deleteTaskItem = async (id: string) => {
+  const sb = getSupabase();
+  if (!sb) throw new Error("Registry Offline");
+  const { error } = await sb.from('tasks').delete().eq('id', id);
+  if (error) throw error;
+  return true;
+};
+
+export const reorderTaskItems = async (tasks: Task[]) => {
+  const sb = getSupabase();
+  if (!sb) throw new Error("Registry Offline");
+  
+  const updates = tasks.map((t, index) => ({
+    id: t.id,
+    priority: index,
+    title: t.title,
+    status: t.status,
+    description: t.description,
+    due_date: t.due_date,
+    updated_at: new Date().toISOString()
+  }));
+
+  const { error } = await sb.from('tasks').upsert(updates);
+  if (error) throw error;
+  return true;
+};
+
+export const authSignOut = async () => {
+  const sb = getSupabase();
+  if (sb) await sb.auth.signOut();
+};
+
+export const checkDatabaseHealth = async (url?: string, key?: string) => {
+  // If specific URL/Key provided, test that instead of the main instance
+  let client = getSupabase();
+  if (url && key) {
+    try {
+      client = createClient(url, key, {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+          detectSessionInUrl: false
+        }
+      });
+    } catch (e) {
+      return { status: 'unhealthy' as const, message: 'Invalid URL format.' };
+    }
+  }
+
+  if (!client) return { status: 'unhealthy' as const, message: 'No client configuration detected.' };
+  
+  // Timeout for health check - we don't want to hang the app init
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+  
+  try {
+    // Probe a subset of critical tables to ensure schema health
+    const criticalTables = ['businesses', 'profiles', 'platform_config'];
+    
+    // We check sequentially or with a shorter timeout to avoid hanging
+    const results = await Promise.all(criticalTables.map(async (table) => {
+      try {
+        const { error } = await client!.from(table).select('id').limit(1).abortSignal(controller.signal);
+        if (error && error.code === '42P01') return table;
+        return null;
+      } catch (e) {
+        return null; // Ignore individual table fetch errors, possibly due to abort
+      }
+    }));
+
+    clearTimeout(timeoutId);
+
+    const missingTables = results.filter(t => t !== null);
+    
+    if (missingTables.length > 0) {
+      return { 
+        status: 'unhealthy' as const, 
+        message: `Schema incomplete. Missing tables [${missingTables.join(', ')}].` 
+      };
+    }
+    
+    return { status: 'healthy' as const };
+  } catch (e: any) { 
+    clearTimeout(timeoutId);
+    console.warn("[Supabase] Health probe skipped or timed out:", e.message);
+    return { status: 'unknown' as const, message: 'Signal strength low. Registry sync might be affected.' }; 
+  }
+};
+
+export const reconnectRegistry = (url: string, key: string) => {
+  localStorage.setItem('findaba_supabase_url', url);
+  localStorage.setItem('findaba_supabase_key', key);
+  _supabaseInstance = null;
+  return getSupabase();
+};
+
+export const purgeLocalRegistry = () => {
+  localStorage.removeItem('findaba_supabase_url');
+  localStorage.removeItem('findaba_supabase_key');
+  _supabaseInstance = null;
+};
+
+export const getRegistryConfig = () => {
+  return {
+    url: localStorage.getItem('findaba_supabase_url') || process.env.SUPABASE_URL || '',
+    key: localStorage.getItem('findaba_supabase_key') || process.env.SUPABASE_ANON_KEY || ''
+  };
+};
+
+export const seedDatabase = async (artisans: Business[]) => {
+  const client = getSupabase();
+  if (!client) return;
+  try {
+    const { count: configCount } = await client.from('platform_config').select('*', { count: 'exact', head: true });
+    if (configCount === 0) await client.from('platform_config').insert([{ id: 1 }]);
+    
+    const { count } = await client.from('businesses').select('*', { count: 'exact', head: true });
+    if (count === 0) {
+      console.log("[Registry] Seeding initial business nodes...");
+      // Seed one by one to use the robust save logic which handles missing columns
+      for (const artisan of artisans) {
+        try {
+          await saveBusinessToDB(artisan);
+        } catch (e) {
+          console.warn(`[Registry] Failed to seed node ${artisan.name}:`, e);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("Seeding failed: Schema might be missing or incomplete.");
+  }
+};
+
+export const updatePlatformConfig = async (updates: Partial<PlatformConfig>) => {
+  const client = getSupabase();
+  
+  // Always update local storage first as a persistent cache/fallback
+  const currentLocal = localStorage.getItem('findaba_platform_config');
+  const parsed = currentLocal ? JSON.parse(currentLocal) : {};
+  const merged = { ...parsed, ...updates };
+  localStorage.setItem('findaba_platform_config', JSON.stringify(merged));
+
+  if (!client) {
+    console.warn("[Registry] Supabase Offline: Saved configuration to local storage only.");
+    return;
+  }
+
+  const { error } = await client.from('platform_config').update(updates).eq('id', 1);
+  if (error) {
+    console.error("[Registry] Supabase Update Error:", error);
+    // We don't throw here because we already saved to local storage
+  }
+};
+
+export const fetchPlatformConfig = async (): Promise<PlatformConfig | null> => {
+  const client = getSupabase();
+  
+  // Try local storage first for speed and offline support
+  const localConfig = localStorage.getItem('findaba_platform_config');
+  const parsedLocal = localConfig ? JSON.parse(localConfig) : null;
+
+  const defaultConfig: PlatformConfig = {
+    id: 1,
+    app_logo: 'https://images.unsplash.com/photo-1614850523296-d8c1af93d400?q=80&w=800&auto=format&fit=crop',
+    oracle_avatar: 'https://images.unsplash.com/photo-1540562760343-6902269a9b13?q=80&w=800&auto=format&fit=crop',
+    hero_images: ["https://images.unsplash.com/photo-1531315630201-bb15bbeb166a?q=80&w=1200"],
+    hero_videos: [],
+    facebook_url: 'https://facebook.com/findaba',
+    instagram_url: 'https://instagram.com/find_aba',
+    twitter_url: 'https://twitter.com/findaba',
+    tiktok_url: '',
+    domain_activated: false,
+    updated_at: new Date().toISOString()
+  };
+
+  if (!client) return parsedLocal || defaultConfig;
+
+  try {
+    const { data, error } = await client.from('platform_config').select('*').eq('id', 1).maybeSingle();
+    if (error) {
+      if (error.code === '42P01') return parsedLocal || defaultConfig;
+      if (error.message.includes('Unexpected token')) return parsedLocal || defaultConfig;
+      throw error;
+    }
+    
+    if (data) {
+      // Sync local storage with cloud data
+      localStorage.setItem('findaba_platform_config', JSON.stringify(data));
+      return data;
+    }
+    
+    // If table exists but no row with id=1, create it
+    const { data: inserted } = await client.from('platform_config').insert([defaultConfig]).select().single();
+    if (inserted) {
+      localStorage.setItem('findaba_platform_config', JSON.stringify(inserted));
+      return inserted;
+    }
+
+    return parsedLocal || defaultConfig;
+  } catch (e) {
+    console.warn("Platform config fetch failed, using local fallback:", e);
+    return parsedLocal || defaultConfig;
+  }
+};
+
+export const logTransaction = async (log: any) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('ledger').insert(log);
+};
+
+export const logPayment = async (log: Partial<PaymentLog>) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('payments').insert(log);
+};
+
+export const createEscrowOrder = async (order: Partial<Order>, business: Business) => {
+  const client = getSupabase();
+  if (!client) throw new Error("Registry Offline");
+  let rate = 0.07; 
+  if (business.subscription_tier === SubscriptionTier.PREMIUM) rate = 0.03;
+  else if (business.subscription_tier === SubscriptionTier.GROWTH) rate = 0.05;
+  const commission = (order.amount || 0) * rate;
+  const merchant_payout = (order.amount || 0) - commission;
+  
+  // Create order in PENDING status (Escrow flow starts here)
+  const finalOrder = { 
+    ...order, 
+    commission_deducted: commission, 
+    merchant_payout, 
+    status: OrderStatus.PENDING, 
+    created_at: new Date().toISOString() 
+  };
+  
+  const { data, error } = await client.from('orders').insert(finalOrder).select().single();
+  if (error) throw error;
+  
+  // 🔹 Trigger Email Notifications
+  // Notify Customer
+  try {
+    const { data: profile } = await client.from('profiles').select('email').eq('id', order.buyer_id || '').single();
+    if (profile?.email) {
+      sendOrderReceivedEmail(profile.email, data.id, order.amount || 0).catch(err => 
+        console.warn("[Email] Customer order email failed:", err)
+      );
+    }
+  } catch (e) {
+    console.warn("[Email] Could not fetch profile for order notification");
+  }
+
+  // Notify Merchant
+  if (business.email) {
+    const customerName = localStorage.getItem('findaba_user_name') || 'A Customer';
+    sendMerchantNewOrderEmail(business.email, data.id, merchant_payout, customerName).catch(err => 
+      console.warn("[Email] Merchant notification failed:", err)
+    );
+  }
+  
+  // Trigger Automation Webhook
+  triggerWebhook(WebhookEvent.NEW_ORDER, { order: data, business_name: business.name });
+  
+  return data;
+};
+
+export const fetchOrdersForBuyer = async (buyerId: string): Promise<Order[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  const { data } = await client.from('orders').select('*, merchant:businesses(*)').eq('buyer_id', buyerId).order('created_at', { ascending: false });
+  return data || [];
+};
+
+export const fetchMerchantOrders = async (merchantId: string): Promise<Order[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  const { data } = await client.from('orders').select('*').eq('merchant_id', merchantId).order('created_at', { ascending: false });
+  return data || [];
+};
+
+export const saveLogisticsOrder = async (email: string, order: LogisticsOrder) => {
+  const client = getSupabase();
+  if (!client) return;
+  
+  const normalizedEmail = normalizeEmail(email);
+  const { data, error } = await client
+    .from('logistics_orders')
+    .insert({ ...order, user_email: normalizedEmail })
+    .select();
+  
+  if (error) throw error;
+
+  // Trigger Make.com Webhook for logistics order
+  await triggerWebhook(WebhookEvent.LOGISTICS_ORDER_CREATED, {
+    order_id: order.id,
+    tracking_id: order.trackingId,
+    customer_email: normalizedEmail,
+    origin: order.pickup_address, // Fixed to match type/user intent
+    destination: order.delivery_address, // Fixed to match type/user intent
+    carrier: order.carrier,
+    total_amount: order.totalFee,
+    timestamp: new Date().toISOString()
+  });
+
+  return data ? data[0] : null;
+};
+
+export const fetchLogisticsOrders = async (email: string): Promise<LogisticsOrder[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  const normalizedEmail = normalizeEmail(email);
+  const { data } = await client.from('logistics_orders').select('*').eq('user_email', normalizedEmail).order('timestamp', { ascending: false });
+  return data || [];
+};
+
+export const fetchTrackingById = async (trackingId: string): Promise<LogisticsOrder | null> => {
+  const client = getSupabase();
+  if (!client) return null;
+  const { data } = await client.from('logistics_orders').select('*').eq('trackingId', trackingId).maybeSingle();
+  return data;
+};
+
+export const uploadImage = async (file: File, bucket: string): Promise<string | null> => {
+  const client = getSupabase();
+  if (!client) return null;
+  
+  const fileName = `${Date.now()}-${file.name.replace(/\s+/g, '_')}`;
+  
+  try {
+    const { data, error } = await client.storage.from(bucket).upload(fileName, file);
+    
+    if (error) {
+      if (error.message.includes('bucket not found') || (error as any).status === 404) {
+        // Attempt to create bucket if it doesn't exist (might fail due to permissions, but worth a try)
+        try {
+          await client.storage.createBucket(bucket, { public: true });
+          // Retry upload once
+          const { data: retryData, error: retryError } = await client.storage.from(bucket).upload(fileName, file);
+          if (retryError) throw retryError;
+          const { data: urlData } = client.storage.from(bucket).getPublicUrl(retryData.path);
+          return urlData.publicUrl;
+        } catch (createErr) {
+          throw new Error(`Bucket '${bucket}' not found. Please create it in your Supabase Storage dashboard.`);
+        }
+      }
+      throw error;
+    }
+    
+    const { data: urlData } = client.storage.from(bucket).getPublicUrl(data.path);
+    return urlData.publicUrl;
+  } catch (err: any) {
+    console.error("[Registry] Upload fault:", err);
+    throw err;
+  }
+};
+
+export const fetchAllBusinesses = async (abortSignal?: AbortSignal): Promise<Business[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    console.log("[Registry] Pulling latest nodes from industrial grid...");
+    let query = client
+      .from('businesses')
+      .select('*')
+      .order('created_at', { ascending: false });
+    
+    if (abortSignal) {
+      query = query.abortSignal(abortSignal);
+    }
+
+    const { data, error } = await query;
+      
+    if (error) {
+      console.warn(`[Registry] Cloud Fetch Issue: ${error.message} (${error.code})`);
+      if (error.code === '42P01') {
+        console.warn("[Registry] Schema missing: 'businesses' table not found.");
+      }
+      return [];
+    }
+    return data || [];
+  } catch (e: any) { 
+    console.error("[Registry] Hardware fault during fetch:", e.message);
+    return []; 
+  }
+};
+
+export const updateBusinessTier = async (businessId: string, tier: HubTier) => {
+  const client = getSupabase();
+  if (!client) throw new Error("Registry Offline");
+  
+  const { error } = await client
+    .from('businesses')
+    .update({ 
+      hub_tier: tier,
+      subscription_tier: tier === HubTier.STARTER ? SubscriptionTier.FREE :
+                        tier === HubTier.LOCAL_TRUST ? SubscriptionTier.VERIFIED :
+                        tier === HubTier.GROWTH_ENGINE ? SubscriptionTier.GROWTH :
+                        SubscriptionTier.PREMIUM,
+      premium_features_enabled: tier !== HubTier.STARTER
+    })
+    .eq('id', businessId);
+    
+  if (error) throw error;
+};
+
+export const updateBusinessInDB = async (id: string, updates: Partial<Business>) => {
+  const client = getSupabase();
+  if (!client) return;
+  
+  let currentPayload = { ...updates };
+  let attempts = 0;
+  const maxAttempts = 5;
+
+  while (attempts < maxAttempts) {
+    const { error } = await client.from('businesses').update(currentPayload).eq('id', id);
+    
+    if (error && error.code === 'PGRST204') {
+      const match = error.message.match(/Could not find the '(.+)' column/);
+      if (match && match[1]) {
+        const columnName = match[1];
+        console.warn(`[Registry] Column '${columnName}' missing in DB, removing from update payload...`);
+        const { [columnName]: _, ...rest } = currentPayload as any;
+        currentPayload = rest;
+        attempts++;
+        continue;
+      }
+    }
+    
+    if (error) {
+      console.error("[Registry] Update Failure:", error);
+    }
+    break;
+  }
+};
+
+export async function saveBusinessToDB(businessData: Partial<Business>): Promise<Business> {
+  const supabase = getSupabase()!;
+  const { data: { session } } = await supabase.auth.getSession();
+  const user = session?.user;
+
+  if (!user) {
+    throw new Error('You must be logged in to register a business.');
+  }
+
+  // 2. Build payload — only real columns from your live schema
+  //    Do NOT include 'id' — Supabase generates UUID automatically on insert
+  const payload: Record<string, unknown> = {
+    name:                         businessData.name ?? '',
+    email:                        businessData.email ?? user.email ?? '',
+    category:                     businessData.category ?? 'General',
+    primary_product_or_service:   businessData.primary_product_or_service ?? null,
+    area:                         businessData.area ?? null,
+    address:                      businessData.address ?? null,
+    phone_whatsapp:               businessData.phone_whatsapp ?? null,
+    phone:                        businessData.phone ?? null,
+    image_url:                    businessData.image_url ?? null,
+    description:                  businessData.description ?? null,
+    location:                     businessData.location ?? null,
+    city:                         businessData.city ?? 'Aba',
+    services:                     businessData.services ?? null,
+    status:                       businessData.status ?? 'pending',
+    is_verified:                  false,
+    hub_tier:                     businessData.hub_tier ?? 'Starter',
+    subscription_tier:            businessData.subscription_tier ?? 'Free',
+    latitude:                     businessData.latitude ?? null,
+    longitude:                    businessData.longitude ?? null,
+    integrity_grade:              'C',
+    verification_status:          'Unverified',
+    verification_level:           'Listed',
+    is_export_ready:              false,
+    premium_features_enabled:     false,
+    active_features:              {},
+    products:                     [],
+    // CRITICAL: user_id links this business to the logged-in user
+    // RLS policy checks auth.uid() = user_id — must match exactly
+    user_id:                      user.id,
+  };
+
+  // 3. Check if this user already has a business registered
+  const { data: existing, error: fetchError } = await supabase
+    .from('businesses')
+    .select('id')
+    .eq('user_id', user.id)
+    .maybeSingle();
+
+  if (fetchError) {
+    throw new Error(`Could not check existing registration: ${fetchError.message}`);
+  }
+
+  let result: Business;
+
+  if (existing?.id) {
+    // 4a. UPDATE existing business — use the real database id
+    const { data, error } = await supabase
+      .from('businesses')
+      .update(payload)
+      .eq('id', existing.id)
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Failed to update business: ${error.message}`);
+    }
+    result = data as Business;
+
+  } else {
+    // 4b. INSERT new business — let Supabase generate the UUID
+    const { data, error } = await supabase
+      .from('businesses')
+      .insert(payload)
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Failed to register business: ${error.message}`);
+    }
+    result = data as Business;
+  }
+
+  return result;
+}
+
+export const fetchFavorites = async (userId: string): Promise<string[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    const { data, error } = await client.from('favorites').select('business_id').eq('user_id', userId);
+    if (error && error.code === '42P01') return [];
+    if (error && error.message.includes('Unexpected token')) return [];
+    return data?.map(f => f.business_id) || [];
+  } catch (e) { return []; }
+};
+
+export const sendMessageToSupabase = async (msg: ChatMessage) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('messages').insert({ 
+    sender_id: msg.sender_id, 
+    receiver_id: msg.receiver_id, 
+    body: (msg as any).body || msg.content, 
+    status: (msg as any).status || 'sent', 
+    created_at: msg.created_at 
+  });
+};
+
+export const subscribeToMessages = (callback: (payload: any) => void) => {
+  const client = getSupabase();
+  if (!client) return { unsubscribe: () => {} };
+  const channel = client.channel('public:messages').on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, callback).subscribe();
+  return { unsubscribe: () => channel.unsubscribe() };
+};
+
+export const subscribeToProfile = (userId: string, callback: (payload: any) => void) => {
+  const client = getSupabase();
+  if (!client) return { unsubscribe: () => {} };
+  const channel = client.channel(`profile:${userId}`)
+    .on('postgres_changes', { 
+      event: 'UPDATE', 
+      schema: 'public', 
+      table: 'profiles',
+      filter: `id=eq.${userId}`
+    }, callback)
+    .subscribe();
+  return { unsubscribe: () => channel.unsubscribe() };
+};
+
+export const fetchAllAdvertorials = async (): Promise<Advertorial[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    const { data, error } = await client.from('advertorials').select('*').order('created_at', { ascending: false });
+    if (error && error.code === '42P01') return [];
+    if (error && error.message.includes('Unexpected token')) return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const fetchMerchantAds = async (bizId: string): Promise<AdCampaign[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  const { data } = await client.from('ads').select('*').eq('business_id', bizId);
+  return data || [];
+};
+
+export const saveAdCampaign = async (ad: any) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('ads').insert(ad);
+};
+
+export const activatePlanFeatures = async (businessId: string, planId: string) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('businesses').update({ subscription_tier: planId, premium_features_enabled: planId !== 'Free' }).eq('id', businessId);
+};
+
+export const fetchThriftAccount = async (email: string | null | undefined): Promise<ThriftAccount | null> => {
+  const client = getSupabase();
+  if (!client || !email) return null;
+  const normalizedEmail = normalizeEmail(email);
+  try {
+    const { data, error } = await client.from('thrift_accounts').select('*').eq('user_email', normalizedEmail).maybeSingle();
+    if (error) {
+      if (error.code === '42P01') throw new Error("Thrift Table Missing: Please run SQL setup.");
+      if (error.message.includes('Unexpected token')) throw new Error("Signal Error: Received HTML instead of JSON. Check Supabase URL.");
+      throw error;
+    }
+    return data;
+  } catch (e: any) {
+    console.error("[Thrift] Fetch fault:", e);
+    throw e;
+  }
+};
+
+export const createThriftAccount = async (email: string, cycle: 'daily' | 'weekly' | 'monthly' | 'quarterly' | 'yearly') => {
+  const client = getSupabase();
+  if (!client) return;
+  const normalizedEmail = normalizeEmail(email);
+  
+  // Arrangement: 3.5% management fee
+  const service_fee_rate = 0.035;
+  
+  const startDate = new Date();
+  const lockedUntil = new Date();
+  
+  if (cycle === 'daily') lockedUntil.setDate(startDate.getDate() + 1);
+  else if (cycle === 'weekly') lockedUntil.setDate(startDate.getDate() + 7);
+  else if (cycle === 'monthly') lockedUntil.setMonth(startDate.getMonth() + 1);
+  else if (cycle === 'quarterly') lockedUntil.setMonth(startDate.getMonth() + 3);
+  else if (cycle === 'yearly') lockedUntil.setFullYear(startDate.getFullYear() + 1);
+  
+  const { error } = await client.from('thrift_accounts').insert({ 
+    user_email: normalizedEmail, 
+    cycle, 
+    total_saved: 0, 
+    status: 'active', 
+    start_date: startDate.toISOString(),
+    locked_until: lockedUntil.toISOString(),
+    service_fee_rate
+  });
+  if (error) throw error;
+};
+
+export const fetchThriftContributions = async (thriftId: string): Promise<ThriftContribution[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    const { data, error } = await client
+      .from('thrift_contributions')
+      .select('*')
+      .eq('thrift_id', thriftId)
+      .order('created_at', { ascending: false });
+    if (error && error.code === '42P01') return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const saveThriftContribution = async (email: string | null | undefined, amount: number) => {
+  const client = getSupabase();
+  if (!client) throw new Error("Registry Offline: Industrial signal not detected.");
+  
+  if (!email) {
+    console.error("[Thrift] Sync failed: Missing user identifier.");
+    throw new Error("AUTH_REQUIRED: Please log in to your Aba industrial account.");
+  }
+
+  const normalizedEmail = normalizeEmail(email);
+  const contributionAmount = Number(amount);
+  
+  if (isNaN(contributionAmount) || contributionAmount <= 0) {
+    throw new Error(`INVALID_AMOUNT: ₦${amount} is not a valid industrial liquidity signal.`);
+  }
+
+  try {
+    console.log(`[Thrift] Syncing signal for ${normalizedEmail}: ₦${contributionAmount}`);
+    const account = await fetchThriftAccount(normalizedEmail);
+    if (!account) {
+      console.error(`[Thrift] Account missing for ${normalizedEmail}`);
+      throw new Error(`ACCOUNT_NOT_FOUND: No active thrift account found for ${normalizedEmail}.`);
+    }
+    
+    // Safety check: Don't allow contribution after lock date
+    if (account.locked_until && new Date(account.locked_until) <= new Date()) {
+      console.warn(`[Thrift] Cycle ended for ${normalizedEmail}. Lock date: ${account.locked_until}`);
+      throw new Error("SAVINGS_CYCLE_ENDED: Your current savings cycle has matured. Please withdraw or start a new cycle.");
+    }
+
+    const { error: contribError } = await client.from('thrift_contributions').insert({
+      thrift_id: normalizedEmail,
+      user_email: normalizedEmail,
+      amount: contributionAmount
+    });
+    
+    if (contribError) {
+      console.error("[Thrift] Signal insert failed:", contribError);
+      throw new Error(`LEDGER_INSERT_FAILED: ${contribError.message}`);
+    }
+
+    const currentTotal = Number(account.total_saved) || 0;
+    const newTotal = currentTotal + contributionAmount;
+    console.log(`[Thrift] Updating ledger total: ₦${currentTotal} -> ₦${newTotal}`);
+    
+    const { error: updateError } = await client.from('thrift_accounts').update({ 
+      total_saved: newTotal 
+    })
+    .eq('user_email', normalizedEmail);
+    
+    if (updateError) {
+      console.error("[Thrift] Ledger update failed:", updateError);
+      throw new Error(`BALANCE_UPDATE_FAILED: ${updateError.message}`);
+    }
+    
+    // Log automation event
+    await triggerWebhook(WebhookEvent.THRIFT_CONTRIBUTION, { email: normalizedEmail, amount: contributionAmount, new_total: newTotal });
+    
+    return { ...account, total_saved: newTotal };
+  } catch (e: any) {
+    console.error("[Thrift] Critical sync fault:", e);
+    throw new Error(e.message || "Industrial signal failure during registry sync.");
+  }
+};
+
+export const withdrawThriftSavings = async (email: string | null | undefined) => {
+  const client = getSupabase();
+  if (!client) throw new Error("Registry Offline: Industrial signal not detected.");
+  
+  if (!email) throw new Error("AUTH_REQUIRED: Missing user identifier.");
+  const normalizedEmail = normalizeEmail(email);
+
+  try {
+    const account = await fetchThriftAccount(normalizedEmail);
+    if (!account) throw new Error("No account found.");
+    
+    // Check maturity
+    const isMatured = account.locked_until && new Date(account.locked_until) <= new Date();
+    if (!isMatured && account.status !== 'matured') {
+      throw new Error("Funds are locked until cycle ends.");
+    }
+
+    if (account.status === 'withdrawn') throw new Error("Funds already withdrawn.");
+
+    const total = Number(account.total_saved);
+    const commission = total * (account.service_fee_rate || 0.035);
+    const payout = total - commission;
+
+    // Update status to withdrawn
+    const { error: updateError } = await client.from('thrift_accounts').update({ 
+      status: 'withdrawn',
+      total_saved: 0 // Reset balance after withdrawal
+    }).eq('user_email', normalizedEmail);
+
+    if (updateError) throw updateError;
+
+    await triggerWebhook(WebhookEvent.THRIFT_WITHDRAWAL, { 
+      email: normalizedEmail, 
+      payout, 
+      commission
+    });
+
+    return { payout, commission };
+  } catch (e: any) {
+    console.error("[Thrift] Withdrawal failure:", e);
+    throw e;
+  }
+};
+
+// --- GROUP THRIFT (ISUSU) SERVICES ---
+
+export const fetchThriftGroups = async (): Promise<ThriftGroup[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  const { data, error } = await client
+    .from('thrift_groups')
+    .select('*')
+    .order('created_at', { ascending: false });
+  if (error && error.code === '42P01') return [];
+  return data || [];
+};
+
+export const createThriftGroup = async (group: Partial<ThriftGroup>, creatorEmail: string, explicitUserId?: string) => {
+  const client = getSupabase();
+  if (!client) return;
+  
+  let userId = explicitUserId;
+  if (!userId) {
+    const { data: user } = await client.auth.getUser();
+    userId = user.user?.id;
+  }
+
+  // Final fallback: try to find user by email in profiles
+  if (!userId && creatorEmail) {
+    const { data: profile } = await client.from('profiles').select('id').eq('email', normalizeEmail(creatorEmail)).maybeSingle();
+    userId = profile?.id;
+  }
+
+  if (!userId) throw new Error("AUTH REQUIRED: Please log in to your Aba industrial account.");
+
+  const { data, error } = await client
+    .from('thrift_groups')
+    .insert({
+      ...group,
+      creator_id: userId,
+      status: 'forming'
+    })
+    .select()
+    .single();
+  
+  if (error) throw error;
+
+  // Add creator as first member
+  await client.from('thrift_group_members').insert({
+    group_id: data.id,
+    user_id: userId,
+    payout_position: 1
+  });
+
+  return data;
+};
+
+export const joinThriftGroup = async (groupId: string, explicitUserId?: string) => {
+  const client = getSupabase();
+  if (!client) throw new Error("Industrial signal offline.");
+  
+  let userId = explicitUserId;
+  if (!userId) {
+    const { data: user } = await client.auth.getUser();
+    userId = user.user?.id;
+  }
+
+  if (!userId) throw new Error("AUTH REQUIRED: Please log in to join this unit.");
+
+  // Get current members count
+  const { data: members } = await client
+    .from('thrift_group_members')
+    .select('id')
+    .eq('group_id', groupId);
+  
+  const nextPosition = (members?.length || 0) + 1;
+
+  const { error } = await client.from('thrift_group_members').insert({
+    group_id: groupId,
+    user_id: userId,
+    payout_position: nextPosition
+  });
+
+  if (error) throw error;
+};
+
+export const fetchThriftGroupDetails = async (groupId: string) => {
+  const client = getSupabase();
+  if (!client) return null;
+
+  const { data: group } = await client.from('thrift_groups').select('*').eq('id', groupId).single();
+  const { data: members } = await client.from('thrift_group_members').select('*').eq('group_id', groupId);
+  const { data: contributions } = await client.from('thrift_group_contributions').select('*').eq('group_id', groupId);
+  const { data: payouts } = await client.from('thrift_payouts').select('*').eq('group_id', groupId);
+
+  return { group, members, contributions, payouts };
+};
+
+export const saveGroupContribution = async (groupId: string, amount: number, cycleNumber: number, explicitUserId?: string) => {
+  const client = getSupabase();
+  if (!client) throw new Error("Industrial signal offline.");
+  
+  let userId = explicitUserId;
+  if (!userId) {
+    const { data: user } = await client.auth.getUser();
+    userId = user.user?.id;
+  }
+  
+  if (!userId) throw new Error("AUTH REQUIRED: Contribution failed.");
+
+  const { error } = await client.from('thrift_group_contributions').insert({
+    group_id: groupId,
+    user_id: userId,
+    amount,
+    cycle_number: cycleNumber
+  });
+
+  if (error) throw error;
+};
+
+export const updateThriftAccountSettlement = async (email: string, details: any) => {
+  const client = getSupabase();
+  if (!client) return;
+  const normalizedEmail = normalizeEmail(email);
+  await client.from('thrift_accounts').update(details).eq('user_email', normalizedEmail);
+};
+
+export const fetchLedgerEntries = async (): Promise<LedgerEntry[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    const { data, error } = await client.from('ledger').select('*').order('created_at', { ascending: false });
+    if (error && error.code === '42P01') return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const updateLedgerSettlement = async (id: string, status: string) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('ledger').update({ settlement_status: status }).eq('id', id);
+};
+
+export const fetchPartnerHotels = async (): Promise<Hotel[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    const { data, error } = await client.from('hotels').select('*').eq('status', 'active');
+    if (error && error.code === '42P01') return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const fetchAllPartnerHotels = async (): Promise<Hotel[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    const { data, error } = await client.from('hotels').select('*').order('created_at', { ascending: false });
+    if (error && error.code === '42P01') return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const logQualityAudit = async (audit: Partial<QualityAudit>) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('quality_audits').insert({ ...audit, created_at: new Date().toISOString() });
+  if (audit.score !== undefined) await client.from('hotels').update({ quality_score: audit.score }).eq('id', audit.hotel_id);
+};
+
+export const updateHotelStatus = async (id: string, status: string) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('hotels').update({ status }).eq('id', id);
+};
+
+export const updateHotelDetails = async (id: string, updates: Partial<Hotel>) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('hotels').update(updates).eq('id', id);
+};
+
+export const createHotelRecord = async (hotel: Partial<Hotel>) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('hotels').insert(hotel);
+};
+
+export const fetchRoomsByHotel = async (hotelId: string): Promise<Room[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    const { data, error } = await client.from('rooms').select('*').eq('hotel_id', hotelId);
+    if (error && error.code === '42P01') return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const updateRoomProtocol = async (id: string, updates: Partial<Room>) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('rooms').update(updates).eq('id', id);
+};
+
+export const addRoomToPartner = async (room: Partial<Room>) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('rooms').insert(room);
+};
+
+export const fetchHospitalityConfig = async (): Promise<HospitalityConfig | null> => {
+  const client = getSupabase();
+  if (!client) return null;
+  try {
+    const { data, error } = await client.from('hospitality_config').select('*').eq('id', 'current').maybeSingle();
+    if (error && error.code === '42P01') return null;
+    return data;
+  } catch (e) { return null; }
+};
+
+export const fetchSRRooms = async (hotelId: string): Promise<Room[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    const { data, error } = await client.from('rooms').select('*').eq('hotel_id', hotelId).eq('room_type', RoomType.SR_EXEC);
+    if (error && error.code === '42P01') return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const createPendingBooking = async (booking: Partial<Booking>) => {
+  const client = getSupabase();
+  if (!client) throw new Error("Registry Offline");
+  
+  const { data, error } = await client
+    .from('bookings')
+    .insert({ ...booking, status: 'pending' })
+    .select()
+    .single();
+    
+  if (error) throw error;
+  return data;
+};
+
+export const finalizeSRBooking = async (booking: Partial<Booking>) => {
+  const client = getSupabase();
+  if (!client) return;
+  // This is now mostly for manual confirmation or post-payment sync
+  const { data, error } = await client.from('bookings').upsert({ ...booking, status: 'confirmed' }).select().single();
+  
+  if (!error && data) {
+    triggerWebhook(WebhookEvent.NEW_BOOKING, data);
+    
+    // 🔹 Trigger Appointment Email
+    try {
+      // Get user profile for email
+      const { data: profile } = await client.from('profiles').select('email').eq('id', data.user_id).single();
+      if (profile?.email) {
+        sendAppointmentEmail(profile.email, data.business_name || 'Industrial Service Provider', data.booking_date).catch(err => 
+          console.warn("[Email] Appointment email failed:", err)
+        );
+      }
+    } catch (e) {
+      console.warn("[Email] Could not fetch profile for appointment notification");
+    }
+  }
+};
+
+export const fetchUserBookings = async (userId: string): Promise<Booking[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    const { data, error } = await client.from('bookings').select('*').eq('user_id', userId).order('created_at', { ascending: false });
+    if (error && error.code === '42P01') return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const fetchBuyerSignals = async (): Promise<BuyerSignal[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    const { data, error } = await client.from('buyer_signals').select('*').order('created_at', { ascending: false });
+    if (error && error.code === '42P01') return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const createBuyerSignal = async (signal: Partial<BuyerSignal>) => {
+  const client = getSupabase();
+  if (!client) return;
+  const { data, error } = await client.from('buyer_signals').insert({ ...signal, status: 'open', response_count: 0, created_at: new Date().toISOString() }).select().single();
+  
+  if (!error && data) {
+    // Trigger Automation Webhook
+    triggerWebhook(WebhookEvent.NEW_SIGNAL, data);
+  }
+};
+
+export const submitSignalInterest = async (interest: Partial<SignalInterest>) => {
+  const client = getSupabase();
+  if (!client) return;
+  const { data, error } = await client.from('signal_interests').insert({ ...interest, created_at: new Date().toISOString() }).select().single();
+  
+  if (!error && data) {
+    triggerWebhook(WebhookEvent.SIGNAL_INTEREST, data);
+  }
+  
+  const { data: signal } = await client.from('buyer_signals').select('response_count').eq('id', interest.signal_id).single();
+  if (signal) await client.from('buyer_signals').update({ response_count: (signal as any).response_count + 1 }).eq('id', interest.signal_id);
+};
+
+export const fetchSignalInterests = async (signalId: string): Promise<SignalInterest[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    const { data, error } = await client.from('signal_interests').select('*').eq('signal_id', signalId).order('created_at', { ascending: false });
+    if (error && error.code === '42P01') return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const closeBuyerSignal = async (id: string) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('buyer_signals').update({ status: 'closed' }).eq('id', id);
+};
+
+export const saveVisionToCloud = async (email: string, prompt: string, result_url: string, mode: string) => {
+  const client = getSupabase();
+  if (!client) return;
+  const normalizedEmail = normalizeEmail(email);
+  await client.from('vision_history').insert({ user_email: normalizedEmail, prompt, result_url, mode, created_at: new Date().toISOString() });
+};
+
+export const fetchVisionHistory = async (email: string): Promise<any[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  const normalizedEmail = normalizeEmail(email);
+  try {
+    const { data, error } = await client.from('vision_history').select('*').eq('user_email', normalizedEmail).order('created_at', { ascending: false });
+    if (error && error.code === '42P01') return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const fetchMessagesFromDB = async (userEmail: string, targetBusinessId: string) => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    const { data, error } = await client
+      .from('messages')
+      .select('*')
+      .or(`and(sender_id.eq.${userEmail},receiver_id.eq.${targetBusinessId}),and(sender_id.eq.${targetBusinessId},receiver_id.eq.${userEmail})`)
+      .order('created_at', { ascending: true });
+    if (error && error.code === '42P01') return [];
+    return data || [];
+  } catch (e) { return []; }
+};
+
+export const getAdvertorials = fetchAllAdvertorials;
+
+export const toggleFavorite = async (userId: string, businessId: string) => {
+  const client = getSupabase();
+  if (!client) return;
+  const { data: existing } = await client.from('favorites').select('*').eq('user_id', userId).eq('business_id', businessId).maybeSingle();
+  if (existing) {
+    await client.from('favorites').delete().eq('user_id', userId).eq('business_id', businessId);
+  } else {
+    await client.from('favorites').insert({ user_id: userId, business_id: businessId });
+  }
+};
+
+export const createAdvertorial = async (ad: Partial<Advertorial>) => {
+  const client = getSupabase();
+  if (!client) throw new Error("Registry Offline");
+  const { data, error } = await client.from('advertorials').insert({
+    ...ad,
+    views: 0,
+    created_at: new Date().toISOString()
+  }).select().single();
+  if (error) throw error;
+  return data;
+};
+
+export const trackAdvertorialView = async (id: string) => {
+  const client = getSupabase();
+  if (!client) return;
+  const { data } = await client.from('advertorials').select('views').eq('id', id).maybeSingle();
+  if (data) {
+    await client.from('advertorials').update({ views: ((data as any).views || 0) + 1 }).eq('id', id);
+  }
+};
+
+export const createWelcomeNotification = async (userId: string) => {
+  const client = getSupabase();
+  if (!client) return;
+  
+  const { error } = await client
+    .from('notifications')
+    .insert([
+      {
+        user_id: userId,
+        title: "Welcome to FindAba",
+        message: "Welcome to FindAba! We're excited to have you on board. Explore the best of Aba's industrial and creative landscape.",
+        type: 'success',
+        read: false,
+        created_at: new Date().toISOString()
+      }
+    ]);
+    
+  if (error) {
+    console.warn("[Registry] Welcome notification failed:", error.message);
+  }
+};
+
+export const fetchNotifications = async (userId: string): Promise<AppNotification[]> => {
+  const client = getSupabase();
+  if (!client) return [];
+  try {
+    const { data, error } = await client
+      .from('notifications')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+    if (error && error.code === '42P01') return [];
+    return (data || []).map(n => ({
+      ...n,
+      timestamp: n.created_at || new Date().toISOString()
+    }));
+  } catch (e) { return []; }
+};
+
+export const markNotificationAsRead = async (id: string) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('notifications').update({ read: true }).eq('id', id);
+};
+
+// --- PURPLE FLEET & DRIVER NODE PROTOCOLS ---
+
+export const fetchDriverByEmail = async (email: string) => {
+  const client = getSupabase();
+  if (!client) return null;
+  const normalizedEmail = normalizeEmail(email);
+  const { data } = await client.from('drivers').select('*').eq('user_email', normalizedEmail).maybeSingle();
+  return data;
+};
+
+export const updateDriverStatus = async (email: string, status: string) => {
+  const client = getSupabase();
+  if (!client) return;
+  const normalizedEmail = normalizeEmail(email);
+  await client.from('drivers').update({ status }).eq('user_email', normalizedEmail);
+};
+
+export const updateDriverCompliance = async (email: string, updates: any) => {
+  const client = getSupabase();
+  if (!client) return;
+  const normalizedEmail = normalizeEmail(email);
+  const { data: driver } = await client.from('drivers').select('*').eq('user_email', normalizedEmail).single();
+  if (!driver) return;
+
+  const newUpdates = { ...updates };
+  const nin = updates.nin_verified ?? driver.nin_verified;
+  const bvn = updates.bvn_verified ?? driver.bvn_verified;
+  const license = updates.license_verified ?? driver.license_verified;
+
+  if (nin && bvn && license) {
+    newUpdates.compliance_level = 'Level 2: Elite';
+  }
+
+  await client.from('drivers').update(newUpdates).eq('user_email', normalizedEmail);
+};
+
+export const fetchAvailableVehicles = async (category: string) => {
+  const client = getSupabase();
+  if (!client) return [];
+  const { data } = await client.from('vehicles')
+    .select('*')
+    .eq('category', category)
+    .eq('status', 'online');
+  return data || [];
+};
+
+export const updateVehicleLocation = async (vehicleId: string, lat: number, lng: number) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('vehicles').update({ current_lat: lat, current_lng: lng }).eq('id', vehicleId);
+};
+
+export const createRideBooking = async (booking: any) => {
+  const client = getSupabase();
+  if (!client) throw new Error("Registry Offline");
+  const { data, error } = await client.from('rides').insert(booking).select().single();
+  if (error) throw error;
+  
+  // Trigger Automation Webhook
+  triggerWebhook(WebhookEvent.RIDE_REQUEST, data);
+  
+  return data;
+};
+
+export const fetchRideBookingsForDriver = async (driverId: string) => {
+  const client = getSupabase();
+  if (!client) return [];
+  const { data } = await client.from('rides').select('*').eq('driver_id', driverId).order('created_at', { ascending: false });
+  return data || [];
+};
+
+export const updateRideBookingStatus = async (id: string, status: string) => {
+  const client = getSupabase();
+  if (!client) return;
+  await client.from('rides').update({ status }).eq('id', id);
+};
+
+export const fetchAllVehicles = async () => {
+  const client = getSupabase();
+  if (!client) return [];
+  const { data } = await client.from('vehicles').select('*');
+  return data || [];
+};
+
+export const fetchOnlineVehicles = async () => {
+  const client = getSupabase();
+  if (!client) return [];
+  const { data } = await client.from('vehicles').select('*').eq('status', 'online');
+  return data || [];
+};
+
+export const subscribeToRideRequests = (driverId: string, callback: (payload: any) => void) => {
+  const client = getSupabase();
+  if (!client) return { unsubscribe: () => {} };
+  const channel = client.channel(`ride_requests:${driverId}`)
+    .on('postgres_changes', { 
+      event: 'INSERT', 
+      schema: 'public', 
+      table: 'rides',
+      filter: `driver_id=eq.${driverId}`
+    }, callback)
+    .subscribe();
+  return { unsubscribe: () => channel.unsubscribe() };
+};
+
+export const searchBusinesses = async (query: string): Promise<Business[]> => {
+  const client = getSupabase();
+  if (!client || !query || query.length < 2) return [];
+  
+  try {
+    const { data, error } = await client
+      .from('businesses')
+      .select('*')
+      .or(`name.ilike.%${query}%,category.ilike.%${query}%,description.ilike.%${query}%,area.ilike.%${query}%`)
+      .limit(10);
+
+    if (error) {
+      console.warn("[Search] Query issue:", error.message);
+      return [];
+    }
+    return data || [];
+  } catch (e) {
+    console.error("[Search] Hardware fault:", e);
+    return [];
+  }
+};
+
+export const upsertDriverSignal = async (driverId: string, vehicleId: string, lat: number, lng: number) => {
+  const client = getSupabase();
+  if (!client) return;
+  
+  try {
+    const { error } = await client
+      .from('driver_signals')
+      .upsert({ 
+        driver_id: driverId, 
+        vehicle_id: vehicleId, 
+        lat, 
+        lng, 
+        updated_at: new Date().toISOString() 
+      }, { onConflict: 'driver_id' });
+      
+    if (error) console.warn("[Logistics] Signal broadcast failed:", error.message);
+  } catch (e) {
+    console.error("[Logistics] Signal hardware fault:", e);
+  }
+};
+
+export const fetchLatestDriverSignals = async () => {
+  const client = getSupabase();
+  if (!client) return [];
+  
+  try {
+    const { data, error } = await client
+      .from('driver_signals')
+      .select('*, vehicles(*)');
+      
+    if (error) {
+      if (error.code === '42P01') return []; 
+      console.warn("[Logistics] Signal fetch issue:", error.message);
+      return [];
+    }
+    return data || [];
+  } catch (e) {
+    return [];
+  }
+};
+
+export const subscribeToDriverSignals = (callback: (payload: any) => void) => {
+  const client = getSupabase();
+  if (!client) return { unsubscribe: () => {} };
+  
+  const channel = client.channel('public:driver_signals')
+    .on('postgres_changes', { 
+      event: '*', 
+      schema: 'public', 
+      table: 'driver_signals' 
+    }, callback)
+    .subscribe();
+    
+  return { unsubscribe: () => channel.unsubscribe() };
+};
+
+export const releaseOrderEscrow = async (orderId: string) => {
+  const client = getSupabase();
+  if (!client) throw new Error("Registry offline");
+  const { data, error } = await client.rpc('release_escrow', { p_order_id: orderId });
+  if (error) throw error;
+  return data;
+};
+
+export const updateOrderStatus = async (orderId: string, status: OrderStatus) => {
+  const client = getSupabase();
+  if (!client) throw new Error("Registry offline");
+  
+  const updates: any = { status, updated_at: new Date().toISOString() };
+  
+  if (status === OrderStatus.SHIPPED) {
+    updates.tracking_id = `CGO-${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
+  }
+
+  const { data, error } = await client
+    .from('orders')
+    .update(updates)
+    .eq('id', orderId)
+    .select()
+    .single();
+    
+  if (error) throw error;
+
+  try {
+    const { data: profile } = await client.from('profiles').select('email').eq('id', data.buyer_id).single();
+    if (profile?.email) {
+      await sendOrderStatusUpdateEmail(
+        profile.email, 
+        status,
+        data.amount,
+        updates.tracking_id || data.tracking_id || 'MESH-LOCAL-AUTO'
+      );
+    }
+  } catch (e) {
+    console.warn("[Registry] Notification signal failed to local broadcast.", e);
+  }
+
+  return data;
+};
+
+export const fetchDisputes = async (merchantId: string) => {
+  const client = getSupabase();
+  if (!client) return [];
+  
+  const { data, error } = await client
+    .from('disputes')
+    .select('*, orders(*)')
+    .eq('merchant_id', merchantId);
+    
+  if (error) return [];
+  return data || [];
+};
+
+export const resolveDispute = async (disputeId: string, status: 'resolved' | 'refunded') => {
+  const client = getSupabase();
+  if (!client) throw new Error("Registry offline");
+  
+  const { data, error } = await client
+    .from('disputes')
+    .update({ status, resolved_at: new Date().toISOString() })
+    .eq('id', disputeId)
+    .select()
+    .single();
+    
+  if (error) throw error;
+  return data;
+};
+
+export const fetchAdminStats = async () => {
+  const client = getSupabase();
+  if (!client) throw new Error("Registry offline");
+  
+  const [businesses, orders, profiles, drivers] = await Promise.all([
+    client.from('businesses').select('*', { count: 'exact', head: true }),
+    client.from('orders').select('*', { count: 'exact', head: true }),
+    client.from('profiles').select('*', { count: 'exact', head: true }),
+    client.from('drivers').select('*', { count: 'exact', head: true })
+  ]);
+  
+  return {
+    businesses: businesses.count || 0,
+    orders: orders.count || 0,
+    users: profiles.count || 0,
+    drivers: drivers.count || 0
+  };
+};
+
+export const createBusinessClaim = async (businessId: string, email: string): Promise<void> => {
+  const sb = getSupabase();
+  if (!sb) throw new Error("Registry offline");
+
+  const { data: { user } } = await sb.auth.getUser();
+  if (!user) throw new Error("Authentication required to claim business.");
+
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  
+  const salt = await bcrypt.genSalt(10);
+  const otpHash = await bcrypt.hash(otp, salt);
+
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+
+  const { data: existingClaim } = await sb
+    .from('business_claims')
+    .select('id')
+    .eq('business_id', businessId)
+    .eq('user_id', user.id)
+    .eq('status', 'pending')
+    .maybeSingle();
+
+  if (existingClaim) {
+    const { error: updateError } = await sb
+      .from('business_claims')
+      .update({
+        otp_hash: otpHash,
+        expires_at: expiresAt,
+        otp_attempts: 0,
+        last_otp_sent_at: new Date().toISOString()
+      })
+      .eq('id', existingClaim.id);
+
+    if (updateError) throw updateError;
+  } else {
+    const { error: insertError } = await sb
+      .from('business_claims')
+      .insert({
+        business_id: businessId,
+        user_id: user.id,
+        email: email,
+        otp_hash: otpHash,
+        expires_at: expiresAt,
+        last_otp_sent_at: new Date().toISOString()
+      });
+
+    if (insertError) throw insertError;
+  }
+
+  try {
+    const emailSubject = "Your FindAba Verification Code";
+    await sendEmail({
+      to: email,
+      subject: emailSubject,
+      html: `<div style="font-family: sans-serif; padding: 20px;">
+        <h2 style="color: #004d2c;">Security Protocol Initiation</h2>
+        <p>A verification signal has been requested for business claiming.</p>
+        <div style="background: #f4f4f4; padding: 15px; border-radius: 8px; font-size: 24px; font-weight: bold; text-align: center; letter-spacing: 5px; color: #d4af37;">
+          ${otp}
+        </div>
+        <p>This code expires in 5 minutes.</p>
+        <p>If you did not request this, please ignore this email.</p>
+      </div>`
+    });
+  } catch (emailErr) {
+    console.error("Failed to send OTP email:", emailErr);
+  }
+};
+
+export const verifyBusinessClaim = async (businessId: string, otp: string): Promise<boolean> => {
+  const sb = getSupabase();
+  if (!sb) throw new Error("Registry offline");
+
+  const { data: { user } } = await sb.auth.getUser();
+  if (!user) throw new Error("Authentication required.");
+
+  const { data: claim, error: fetchError } = await sb
+    .from('business_claims')
+    .select('*')
+    .eq('business_id', businessId)
+    .eq('user_id', user.id)
+    .eq('status', 'pending')
+    .single();
+
+  if (fetchError || !claim) {
+    throw new Error("No active claim found for this business.");
+  }
+
+  if (claim.locked_until && new Date(claim.locked_until) > new Date()) {
+    const minutesLeft = Math.ceil((new Date(claim.locked_until).getTime() - Date.now()) / 60000);
+    throw new Error(`Security Lockout: Too many failed attempts. Try again in ${minutesLeft} minutes.`);
+  }
+
+  if (new Date(claim.expires_at) < new Date()) {
+    throw new Error("OTP Expired: Please request a new verification code.");
+  }
+
+  const isValid = await bcrypt.compare(otp, claim.otp_hash);
+
+  if (!isValid) {
+    const nextAttempts = (claim.otp_attempts || 0) + 1;
+    let lockedUntil = null;
+    
+    if (nextAttempts >= 5) {
+      lockedUntil = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    }
+
+    await sb
+      .from('business_claims')
+      .update({ 
+        otp_attempts: nextAttempts,
+        locked_until: lockedUntil
+      })
+      .eq('id', claim.id);
+
+    if (nextAttempts >= 5) {
+      throw new Error("Security Lockout: 5 failed attempts. Access suspended for 10 minutes.");
+    } else {
+      throw new Error(`Invalid Code: ${5 - nextAttempts} attempts remaining.`);
+    }
+  }
+
+  const { error: verifyError } = await sb
+    .from('business_claims')
+    .update({ 
+      status: 'verified',
+      otp_attempts: 0,
+      verified_at: new Date().toISOString()
+    })
+    .eq('id', claim.id);
+
+  if (verifyError) throw verifyError;
+
+  return true;
+};
+
+export const sendSupportMessage = async (msg: SupportMessage) => {
+  const sb = getSupabase();
+  if (!sb) return { error: "Offline" };
+  
+  return await sb
+    .from('support_messages')
+    .insert([msg])
+    .select()
+    .single();
+};
+
+export const fetchSupportMessages = async () => {
+  const sb = getSupabase();
+  if (!sb) return [];
+  
+  const { data, error } = await sb
+    .from('support_messages')
+    .select('*')
+    .order('created_at', { ascending: false });
+    
+  if (error) {
+    console.error("[Registry] Failed to fetch support signals:", error);
+    return [];
+  }
+  return data;
+};
+
+export const updateSupportMessageStatus = async (id: string, status: 'read' | 'archived') => {
+  const sb = getSupabase();
+  if (!sb) return { error: "Offline" };
+  
+  return await sb
+    .from('support_messages')
+    .update({ status })
+    .eq('id', id);
+};
+
+export async function checkSupabaseConnection(): Promise<boolean> {
+  const health = await checkDatabaseHealth();
+  return health.status === 'healthy';
+}
+
+export async function fetchUserBusiness(userId: string): Promise<Business | null> {
+  const supabase = getSupabase();
+  if (!supabase) return null;
+  const { data } = await supabase.from('businesses').select('*').eq('user_id', userId).maybeSingle();
+  return data;
+}
+
+export async function fetchHotels(): Promise<Hotel[]> {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+  const { data, error } = await supabase.from('hotels').select('*').order('created_at', { ascending: false });
+  if (error) return [];
+  return data || [];
+}
+
+// Ensure fetchSavings is still there
+export async function fetchSavings(userId: string): Promise<any[]> {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+  const { data, error } = await supabase.from('savings').select('*').eq('user_id', userId).order('created_at', { ascending: false });
+  if (error) return [];
+  return data || [];
+}
+
+export async function fetchLogisticsOrdersForUser(userId?: string): Promise<LogisticsOrder[]> {
+  const supabase = getSupabase();
+  if (!supabase) return [];
+  let query = supabase.from('logistics_orders').select('*').order('created_at', { ascending: false });
+  if (userId) query = query.eq('user_id', userId);
+  const { data, error } = await query;
+  if (error) return [];
+  return data || [];
+}
